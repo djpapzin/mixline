@@ -1,0 +1,7 @@
+__pycache__/
+.DS_Store
+test/fixtures/
+outputs/
+node_modules/
+dist/
+.env*
