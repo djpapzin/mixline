@@ -54,7 +54,70 @@ function renderLanes(){
 }
 function update(render=true){
  const any=tracks.length>0;
- $('match').disabled=busy||!any;$('arrange').disabled=busy||tracks.length<2;$('export').disabled=busy||!any||matched!==tempo();$('play').disabled=busy||!any;$(…2212 tokens truncated…y+79-playlistGain(item,Math.min(item.end-1e-7,time))*67;if(n)c.lineTo(wx,wy);else c.moveTo(wx,wy);}c.stroke();c.restore();
+ $('match').disabled=busy||!any;$('arrange').disabled=busy||tracks.length<2;$('export').disabled=busy||!any||matched!==tempo();$('play').disabled=busy||!any;$('stop').disabled=busy||!any;
+ for(const el of document.querySelectorAll('#add-songs,#tempo,#fade,#start'))el.disabled=busy;
+ $('start').value=(chosen()?.start||0).toFixed(2);$('start').step=beat().toFixed(4);$('start').disabled=busy||!chosen();$('fade-value').textContent=`${$('fade').value} beats · ${fade().toFixed(1)}s`;
+ $('total').textContent=`/ ${fmt(plan().duration)}`;$('track-count').textContent=tracks.length?`${tracks.length} songs · drop more below to keep building`:'No fixed lane limit · one song per row';
+ if(render)renderLanes();syncEditor();draw();
+}
+function arranged(){
+ if(!tracks.length)return;tracks[0].start=0;
+ for(let i=1;i<tracks.length;i++){
+  const prev=tracks[i-1],current=tracks[i],overlap=Math.min(fade(),clipBounds(prev).duration,clipBounds(current).duration);
+  const desired=prev.start+clipBounds(prev).duration-overlap,phase=prev.start+((prev.offset||0)-clipBounds(prev).trimIn)/(prev.rate||1)-((current.offset||0)-clipBounds(current).trimIn)/(current.rate||1);
+  current.start=Math.max(prev.start,phase+Math.round((desired-phase)/beat())*beat());
+ }
+ position=0;update();status('Songs arranged in sequence.',`${tracks.length} lanes with beat-aligned starts and up to ${$('fade').value}-beat transitions. Drag any clip to adjust.`);
+}
+function peaks(buffer){const out=new Float32Array(2200),pcm=buffer.getChannelData(0),hop=Math.max(1,Math.floor(pcm.length/out.length));for(let i=0;i<out.length;i++)for(let j=i*hop;j<Math.min(pcm.length,(i+1)*hop);j+=Math.max(1,Math.floor(hop/100)))out[i]=Math.max(out[i],Math.abs(pcm[j]));return out;}
+async function decode(file){
+ if(file.size>100*1024**2)throw Error(`${file.name}: choose a song under 100 MB.`);
+ const buffer=await audio().decodeAudioData(await file.arrayBuffer());if(buffer.duration>1800||buffer.duration<1)throw Error('Choose a song between one second and thirty minutes.');
+ const samples=new Float32Array(Math.min(buffer.length,buffer.sampleRate*90));for(let ch=0;ch<buffer.numberOfChannels;ch++){const channel=buffer.getChannelData(ch);for(let i=0;i<samples.length;i++)samples[i]+=channel[i]/buffer.numberOfChannels;}
+ const worker=new Worker(new URL('./bpm-worker.js',import.meta.url),{type:'module'});
+ const grid=await new Promise(resolve=>{const timer=setTimeout(()=>{worker.terminate();resolve(null);},12000);worker.onmessage=e=>{clearTimeout(timer);worker.terminate();resolve(e.data.grid);};worker.onerror=()=>{clearTimeout(timer);worker.terminate();resolve(null);};worker.postMessage({samples,sampleRate:buffer.sampleRate},[samples.buffer]);});
+ return {id:nextId++,file,original:buffer,buffer,bpm:grid?.bpm||null,offset:grid?.offset||0,start:0,rate:1,target:null,peaks:peaks(buffer)};
+}
+async function addFiles(files,replaceId=null){
+ if(busy)return;const audioFiles=Array.from(files).filter(f=>f.type.startsWith('audio/')||/\.(mp3|wav|m4a|aac|flac|aif|aiff|ogg)$/i.test(f.name));if(!audioFiles.length){status('Choose audio files.','Drop MP3, WAV, M4A, FLAC, AIFF or OGG songs.');return;}
+ snapshot();stop();busy=true;update();const failures=[];let added=0;
+ try{for(const [index,file]of audioFiles.entries()){
+  status(`Loading ${index+1} of ${audioFiles.length}: ${file.name}`,'Every song gets its own lane. Audio stays on your device.');
+  try{const track=await decode(file),old=tracks.findIndex(t=>t.id===replaceId);if(old>=0){track.start=tracks[old].start;tracks[old]=track;replaceId=null;}else{const previous=tracks.at(-1);track.start=previous?Math.max(previous.start,previous.start+clipBounds(previous).duration-fade()):0;tracks.push(track);}selected=track.id;added++;matched=null;update();}
+  catch(error){failures.push(error.message);}
+ }}finally{busy=false;update();status(`${added} song${added===1?'':'s'} loaded · ${tracks.length} lanes.`,failures.length?failures.join(' '):'Set or correct each original BPM, then open Mix settings to match all songs.');}
+}
+async function match(){
+ if(busy||!tracks.length)return;const target=tempo();if(!Number.isFinite(target)||target<40||target>240){status('Check the session BPM.','Use 40–240 BPM.');return;}
+ for(const [i,t]of tracks.entries())if(!Number.isFinite(t.bpm)||t.bpm<30||t.bpm>300||target/t.bpm<.5||target/t.bpm>2){status(`Set the original BPM for track ${i+1}.`,'Matching supports half to double speed. Unknown BPM is never guessed.');return;}
+ snapshot();stop();busy=true;update();
+ try{const prepared=[];for(const [i,t]of tracks.entries()){
+  const rate=target/t.bpm;status(`Matching track ${i+1} of ${tracks.length} to ${target} BPM…`,'Pitch-preserving processing runs on your device.');
+  let buffer=t.original;if(Math.abs(rate-1)>.000001){let data;if(['localhost','127.0.0.1'].includes(location.hostname)&&location.port==='8790'){const response=await fetch('/api/stretch',{method:'POST',headers:{'X-Tempo-Ratio':String(rate)},body:t.file,signal:AbortSignal.timeout(245000)});if(!response.ok)throw Error((await response.json()).error);data=await response.arrayBuffer();}else{const {stretchInBrowser}=await import('./browser-stretch.js');data=await stretchInBrowser(t.file,rate,message=>status(`Matching track ${i+1} of ${tracks.length} to ${target} BPM…`,message));}buffer=await audio().decodeAudioData(data);}prepared.push({buffer,rate,target});
+ }tracks.forEach((t,i)=>Object.assign(t,prepared[i]));matched=target;arranged();}
+ catch(error){matched=null;status('Tempo matching did not finish.',error.message);}finally{busy=false;update();}
+}
+async function exportMix(){
+ if(busy||!tracks.length||matched!==tempo())return;snapshot();stop();busy=true;update();
+ try{const p=plan(),frames=Math.ceil((p.duration+.04)*44100);if(frames*4+44>0xffffffff)throw Error('This mix exceeds the WAV file-size limit.');
+ status('Rendering all playlist lanes…',`${tracks.length} songs · stereo 44.1 kHz / 16-bit WAV. Long mixes need available memory.`);await new Promise(r=>setTimeout(r,40));
+ const offline=new OfflineAudioContext(2,frames,44100);schedulePlaylist(offline,p,0,offline.destination);const rendered=await offline.startRendering(),wav=encodeWav(rendered);
+ const url=URL.createObjectURL(new Blob([wav.data],{type:'audio/wav'})),a=document.createElement('a');a.href=url;a.download='Mixline - Untitled mix.wav';a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);
+ status('Your mix is exported.',`${tracks.length} songs · ${fmt(p.duration)}.${wav.normalized?' Peak-normalized.':''} Preview mute does not mute the export.`);
+ }catch(error){status('Export could not finish.',error.message||'The arrangement may exceed available memory.');}finally{busy=false;update();}
+}
+function draw(){
+ const p=plan(),duration=Math.max(30,p.duration),available=Math.max(400,scroll.clientWidth),h=height();
+ px=$('zoom').value==='fit'?available/duration:Number($('zoom').value);const width=Math.min(30000,Math.max(available,Math.ceil(duration*px)));px=width/duration;
+ const dpr=Math.min(devicePixelRatio||1,2);if(canvas.width!==Math.round(width*dpr)||canvas.height!==Math.round(h*dpr)){canvas.width=Math.round(width*dpr);canvas.height=Math.round(h*dpr);}canvas.style.width=`${width}px`;canvas.style.height=`${h}px`;
+ const c=canvas.getContext('2d');c.setTransform(dpr,0,0,dpr,0,0);c.clearRect(0,0,width,h);c.fillStyle='#121820';c.fillRect(0,0,width,h);
+ const interval=px*beat()>12?beat()*4:Math.max(10,Math.ceil(duration/16/10)*10);c.font='9px sans-serif';for(let sec=0;sec<=duration;sec+=interval){const x=sec*px;c.strokeStyle='#29323f';c.beginPath();c.moveTo(x,0);c.lineTo(x,h);c.stroke();c.fillStyle='#8492a5';c.fillText(fmt(sec),x+5,21);}
+ for(let i=0;i<=rows();i++){const y=RULER+i*ROW;c.strokeStyle='#303947';c.beginPath();c.moveTo(0,y);c.lineTo(width,y);c.stroke();}
+ for(let i=0;i<rows();i++){
+  const t=tracks[i],y=RULER+i*ROW+9;if(!t){c.fillStyle='#526175';c.font='12px sans-serif';c.fillText(i===tracks.length?'＋ DROP MORE SONGS HERE':'',24,y+43);continue;}
+  const color=colors[i%colors.length],x=t.start*px,item=p.items[i],w=item.duration*px;c.fillStyle=color+'22';c.fillRect(x,y,w,82);c.strokeStyle=color;c.lineWidth=t.id===selected?2:1;c.strokeRect(x+.5,y+.5,w-1,81);c.lineWidth=1;
+  c.save();c.beginPath();c.rect(x,y,w,82);c.clip();c.fillStyle=color;c.font='10px sans-serif';c.fillText(`${t.file.name} · ${t.bpm?t.bpm+' BPM':'BPM unknown'}${t.target?' → '+t.target+' BPM':''}`,x+10,y+16);c.beginPath();for(let n=0;n<t.peaks.length;n++){const originalTime=n/t.peaks.length*item.sourceDuration;if(originalTime<item.trimIn||originalTime>item.trimOut)continue;const v=t.peaks[n]*24,wx=x+(originalTime-item.trimIn)/item.rate*px;c.moveTo(wx,y+51-v);c.lineTo(wx,y+51+v);}c.strokeStyle=color;c.globalAlpha=.8;c.stroke();c.globalAlpha=1;
+  c.strokeStyle='#b5f1bf';c.beginPath();for(let n=0;n<=100;n++){const time=t.start+item.duration*n/100,wx=time*px,wy=y+79-playlistGain(item,Math.min(item.end-1e-7,time))*67;if(n)c.lineTo(wx,wy);else c.moveTo(wx,wy);}c.stroke();c.restore();
   // Wide lower grips trim the audio; green upper grips control fade lengths.
   c.fillStyle=color;c.fillRect(x+1,y+56,7,24);c.fillRect(x+w-8,y+56,7,24);
   const fadeX=[x+item.fadeIn*px,x+w-item.fadeOut*px];
